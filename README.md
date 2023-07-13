@@ -7,7 +7,8 @@ The default configuration comes out of the box with the following servers
 * Bastion
 * Concourse CI
 * Gogs
-* Nexus CI/CD Server
+* Nexus Artifact Server
+* Hashicorp Vault
 
 
 ### Libraries and Tools
