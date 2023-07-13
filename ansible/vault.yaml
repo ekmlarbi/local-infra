@@ -1,0 +1,139 @@
+---
+- name: Wait for ssh connection
+  hosts: all
+  gather_facts: False
+  tasks: 
+  - name: Ensure ssh port open
+    ansible.builtin.wait_for:
+      port: 22
+      delay: 60
+      timeout: 300
+      search_regex: OpenSSH
+      host: '{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}'
+    vars:
+      ansible_connection: local
+
+- name: Download and unpack Vault installer
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check vault folder stats
+    ansible.builtin.stat:
+      path: /usr/bin/vault
+    register: stat_result
+  - name: "Install packages"
+    ansible.builtin.apt: "name={{ item }} state=present"
+    with_items:
+      - unzip
+      - net-tools  
+  - name: Download vault
+    ansible.builtin.get_url: 
+      url: https://releases.hashicorp.com/vault/1.9.3/vault_1.9.3_linux_amd64.zip
+      dest: /opt/
+    register: download_result  
+    when: not stat_result.stat.exists 
+  - name: Untar vault installer
+    ansible.builtin.unarchive:
+      src: "{{download_result.dest}}"
+      dest: /opt/ 
+      remote_src: True   
+    when: not stat_result.stat.exists    
+  - name: Copy vault to /usr/bin
+    ansible.builtin.shell: cp /opt/vault /usr/bin/
+    when: not stat_result.stat.exists
+  - name: Generate vault folders
+    ansible.builtin.shell: |
+      mkdir /etc/vault
+      mkdir /vault-data
+      mkdir -p /logs/vault/ 
+      touch /etc/vault/config.hcl 
+    when: not stat_result.stat.exists
+  - name: apply web config
+    ansible.builtin.blockinfile:
+      path: /etc/vault/config.hcl
+      block: |
+        api_addr = "http://192.168.1.72:8200"
+        max_lease_ttl = "10h"
+        default_lease_ttl = "10h"
+        ui = true
+        listener "tcp" {
+          address     = "0.0.0.0:8200"
+          tls_disable = "true"
+        }
+        storage "file" {
+          path = "/vault-data"
+        }
+
+
+
+- name: Create systemd unit files
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check resource stats
+    ansible.builtin.stat:
+      path: /etc/systemd/system/vault.service
+    register: stat_result  
+  - name: Touch /etc/systemd/system/vault.service file in place
+    ansible.builtin.shell: touch /etc/systemd/system/vault.service
+    when: not stat_result.stat.exists  
+  - name: Generate /etc/systemd/system/vault.service
+    ansible.builtin.blockinfile:
+      path: /etc/systemd/system/vault.service
+      block: |
+        [Unit]
+        Description=vault service
+        Requires=network-online.target
+        After=network-online.target
+        ConditionFileNotEmpty=/etc/vault/config.hcl
+
+        [Service]
+        EnvironmentFile=-/etc/sysconfig/vault
+        Environment=GOMAXPROCS=2
+        Restart=on-failure
+        ExecStart=/usr/bin/vault server -config=/etc/vault/config.hcl
+        StandardOutput=/logs/vault/output.log
+        StandardError=/logs/vault/error.log
+        LimitMEMLOCK=infinity
+        ExecReload=/bin/kill -HUP $MAINPID
+        KillSignal=SIGTERM
+
+        [Install]
+        WantedBy=multi-user.target
+    when: not stat_result.stat.exists
+  - name: Start service
+    ansible.builtin.shell: |
+      systemctl daemon-reload vault
+      systemctl start vault
+      systemctl enable vault
+      systemctl status vault
+      systemctl is-active vault
+    register: systemctl_result 
+  - ansible.builtin.debug: msg={{ systemctl_result }}
+
+- name: Verify service running
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Check with ps
+    ansible.builtin.shell: ps aux | grep vault
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Wait a minute
+    ansible.builtin.pause:
+      minutes: 0.5
+  - name: Check with netstat
+    ansible.builtin.shell: netstat -plnt
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Clean /etc/resolv.conf
+    ansible.builtin.shell: |
+      >/etc/resolv.conf
+  - name: apply dns config
+    ansible.builtin.blockinfile:
+      path: /etc/resolv.conf
+      block: |
+        nameserver 192.168.1.250

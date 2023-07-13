@@ -1,0 +1,26 @@
+resources:
+- name: k8s-cluster-pipeline-code
+  type: git
+  source:
+    password: password
+    username: k8s_bot
+    uri: http://192.168.1.73:3000/k8s_bot/cluster-pipeline.git
+    branch: master
+    skip_ssl_verification: true
+- name: k8s-cluster-environments
+  type: git
+  source:
+    password: password
+    username: k8s_bot
+    uri: http://192.168.1.73:3000/k8s_bot/cluster-environments.git
+    branch: master
+    skip_ssl_verification: true
+
+jobs:
+- name: unit
+  plan:
+  - in_parallel:
+    - get: k8s-cluster-pipeline-code
+    - get: k8s-cluster-environments
+  - task: test
+    file: booklit/ci/test.yml

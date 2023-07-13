@@ -1,0 +1,332 @@
+---
+- name: Wait for ssh connection
+  hosts: all
+  gather_facts: False
+  tasks: 
+  - name: Ensure ssh port open
+    ansible.builtin.wait_for:
+      port: 22
+      delay: 60
+      timeout: 300
+      search_regex: OpenSSH
+      host: '{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}'
+    vars:
+      ansible_connection: local
+
+- name: Install postgresql
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: "Find out if PostgreSQL is initialized"
+    ansible.builtin.stat:
+      path: "/var/lib/pgsql/data/pg_hba.conf"
+    register: postgres_data
+  - name: "Install postgres packages"
+    ansible.builtin.apt: "name={{ item }} state=present"
+    with_items:
+      - python3-pip
+      - postgresql
+      - postgresql-contrib
+      - postgresql-client
+      - net-tools  
+  - name: "Install Python packages"
+    ansible.builtin.pip: "name={{ item }} executable=pip3 state=present"
+    with_items:
+      - psycopg2-binary
+  - name: "Start and enable services"
+    ansible.builtin.service: "name={{ item }} state=started enabled=yes"
+    with_items:
+      - postgresql
+  - name: "Create app database"
+    community.postgresql.postgresql_db:
+      state: present
+      name: atc
+    become: yes
+    become_user: postgres
+  - name: "Create db user"
+    community.postgresql.postgresql_user:
+      state: present
+      name: concourse
+      password: concourseP1ssw0rd
+    become: yes
+    become_user: postgres
+  - name: "Grant db user access to app db"
+    community.postgresql.postgresql_privs:
+      type: database
+      database: atc
+      roles: concourse
+      grant_option: no
+      privs: ALL
+    become: yes
+    become_user: postgres
+  # - name: Add some dummy data to our database
+  #   become: True
+  #   become_user: postgres
+  #   shell: psql {{ db_name }} < /tmp/dump.sql
+  # - name: "Allow md5 connection for the db user"
+  #   postgresql_pg_hba:
+  #     dest: "~/data/pg_hba.conf"
+  #     contype: host
+  #     databases: all
+  #     method: md5
+  #     users: concourse
+  #     create: true
+  #   become: yes
+  #   become_user: postgres
+  #   notify: restart postgres
+  # handlers:
+  #   - name: restart postgres
+  #     service: name=postgresql state=restarted
+
+- name: Download and unpack concourse
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check concourse folder stats
+    ansible.builtin.stat:
+      path: /opt/concourse
+    register: stat_result  
+  - name: Download concourse
+    ansible.builtin.get_url: 
+      url: https://github.com/concourse/concourse/releases/download/v7.4.4/concourse-7.4.4-linux-amd64.tgz
+      dest: /opt/
+    register: download_result  
+    when: not stat_result.stat.exists 
+  - name: Untar concourse installer
+    ansible.builtin.unarchive:
+      src: "{{download_result.dest}}"
+      dest: /opt/
+      remote_src: True   
+    when: not stat_result.stat.exists    
+  - name: Find concourse folder
+    ansible.builtin.find: 
+      paths: /opt
+      pattern: "concourse*"
+      file_type: directory
+    register: find_result
+  - ansible.builtin.debug: msg={{ find_result }}
+  - name: Rename concourse folder
+    ansible.builtin.shell: mv {{find_result.files[0].path}} /opt/concourse
+    when: 
+    - not (find_result.files[0].path == '/opt/concourse')
+
+- name: Download and unpack fly
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check fly stats
+    ansible.builtin.stat:
+      path: /usr/bin/fly
+    register: stat_result  
+  - name: Download fly
+    ansible.builtin.get_url: 
+      url: https://github.com/concourse/concourse/releases/download/v7.4.4/fly-7.4.4-linux-amd64.tgz
+      dest: /opt/
+    register: download_result  
+    when: not stat_result.stat.exists 
+  - name: Untar fly installer
+    ansible.builtin.unarchive:
+      src: "{{download_result.dest}}"
+      dest: /opt/
+      remote_src: True   
+    when: not stat_result.stat.exists    
+  - name: Copy fly /usr/bin
+    ansible.builtin.shell: cp /opt/fly /usr/bin/fly
+    when: not stat_result.stat.exists  
+
+- name: Create concourse user to own concourse folders
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Touch /etc/concourse folder in place
+    ansible.builtin.shell: mkdir -p /etc/concourse
+  - name: Touch /var/lib/concourse folder in place
+    ansible.builtin.shell: mkdir -p /var/lib/concourse
+  - name: Ensure group concourse exists
+    ansible.builtin.group: 
+      name: concourse
+      state: present
+  - name: Create concourse user
+    ansible.builtin.user: 
+      name: concourse
+      group: concourse
+  - name: Make concourse user owner of concourse folder
+    ansible.builtin.file: 
+      path: /opt/concourse
+      state: directory
+      owner: concourse
+      group: concourse
+      recurse: yes    
+  - name: Make concourse user owner of sonatype-work folder
+    ansible.builtin.file:
+      path: /etc/concourse
+      state: directory
+      owner: concourse
+      group: concourse
+      recurse: yes
+  - name: Make concourse user owner of sonatype-work folder
+    ansible.builtin.file:
+      path: /var/lib/concourse
+      state: directory
+      owner: concourse
+      group: concourse
+      recurse: no
+
+- name: Create PKI keys
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check concourse folder stats
+    ansible.builtin.stat:
+      path: /etc/concourse/authorized_worker_keys
+    register: stat_result  
+  - name: Generate keys
+    ansible.builtin.shell: |
+      mkdir -p /etc/concourse
+      ssh-keygen -t rsa -b 4096 -m PEM -q -N '' -f /etc/concourse/tsa_host_key
+      ssh-keygen -t rsa -b 4096 -m PEM -q -N '' -f /etc/concourse/worker_key
+      ssh-keygen -t rsa -b 4096 -m PEM -q -N '' -f /etc/concourse/session_signing_key
+      cp /etc/concourse/worker_key.pub /etc/concourse/authorized_worker_keys
+      chmod 0644 /etc/concourse/*
+    when: not stat_result.stat.exists
+
+- name: Configure concourse
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Check web_environment stats
+    ansible.builtin.stat:
+      path: /etc/concourse/web_environment
+    register: stat_result  
+  - name: Touch web_environment file in place
+    ansible.builtin.shell: touch /etc/concourse/web_environment
+    when: not stat_result.stat.exists  
+  - name: apply web config
+    ansible.builtin.blockinfile:
+      path: /etc/concourse/web_environment
+      block: |
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/concourse/bin
+        CONCOURSE_ADD_LOCAL_USER=erasmus:password
+        CONCOURSE_MAIN_TEAM_LOCAL_USER=erasmus
+        CONCOURSE_SESSION_SIGNING_KEY=/etc/concourse/session_signing_key
+        CONCOURSE_TSA_HOST_KEY=/etc/concourse/tsa_host_key
+        CONCOURSE_TSA_AUTHORIZED_KEYS=/etc/concourse/authorized_worker_keys
+        CONCOURSE_POSTGRES_HOST=127.0.0.1
+        CONCOURSE_POSTGRES_PORT=5432
+        CONCOURSE_POSTGRES_USER=concourse
+        CONCOURSE_POSTGRES_PASSWORD=concourseP1ssw0rd
+        CONCOURSE_POSTGRES_DATABASE=atc
+        CONCOURSE_EXTERNAL_URL=http://192.168.1.74:8080
+  - name: Check web_environment stats
+    ansible.builtin.stat:
+      path: /etc/concourse/worker_environment
+    register: stat_result  
+  - name: Touch worker_environment file in place
+    ansible.builtin.shell: touch /etc/concourse/worker_environment
+    when: not stat_result.stat.exists  
+  - name: apply worker config
+    ansible.builtin.blockinfile:
+      path: /etc/concourse/worker_environment
+      block: |
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/concourse/bin
+        CONCOURSE_WORK_DIR=/var/lib/concourse
+        CONCOURSE_TSA_HOST=192.168.1.74:2222
+        CONCOURSE_TSA_PUBLIC_KEY=/etc/concourse/tsa_host_key.pub
+        CONCOURSE_TSA_WORKER_PRIVATE_KEY=/etc/concourse/worker_key
+        CONCOURSE_GARDEN_DNS_SERVER=192.168.1.250
+        CONCOURSE_GARDEN_ALLOW_HOST_ACCESS="true"
+
+- name: Create systemd unit files
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check concourse folder stats
+    ansible.builtin.stat:
+      path: /etc/systemd/system/concourse-web.service
+    register: stat_result  
+  - name: Touch /etc/systemd/system/concourse-web.service file in place
+    ansible.builtin.shell: touch /etc/systemd/system/concourse-web.service
+    when: not stat_result.stat.exists  
+  - name: Generate /etc/systemd/system/concourse-web.service
+    ansible.builtin.blockinfile:
+      path: /etc/systemd/system/concourse-web.service
+      block: |
+        [Unit]
+        Description=Concourse CI web process (ATC and TSA)
+        After=postgresql.service
+
+        [Service]
+        User=concourse
+        Restart=on-failure
+        EnvironmentFile=/etc/concourse/web_environment
+        ExecStart=/opt/concourse/bin/concourse web
+
+        [Install]
+        WantedBy=multi-user.target
+    when: not stat_result.stat.exists  
+  - name: Check concourse folder stats
+    ansible.builtin.stat:
+      path: /etc/systemd/system/concourse-worker.service
+    register: stat_result  
+  - name: Touch /etc/systemd/system/concourse-worker.service file in place
+    ansible.builtin.shell: touch /etc/systemd/system/concourse-worker.service
+    when: not stat_result.stat.exists  
+  - name: Generate /etc/systemd/system/concourse-worker.service
+    ansible.builtin.blockinfile:
+      path: /etc/systemd/system/concourse-worker.service
+      block: |
+        [Unit]
+        Description=Concourse CI worker process
+        After=concourse-web.service
+
+        [Service]
+        User=root
+        Restart=on-failure
+        EnvironmentFile=/etc/concourse/worker_environment
+        ExecStart=/opt/concourse/bin/concourse worker
+
+        [Install]
+        WantedBy=multi-user.target
+    when: not stat_result.stat.exists  
+  - name: Start concourse service
+    ansible.builtin.shell: |
+      systemctl daemon-reload
+      systemctl start concourse-web concourse-worker
+      systemctl enable concourse-web concourse-worker
+      systemctl status concourse-web concourse-worker
+      systemctl is-active concourse-worker concourse-web
+    register: systemctl_result 
+  - ansible.builtin.debug: msg={{ systemctl_result }}
+
+
+- name: Verify service running
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Check with ps
+    ansible.builtin.shell: ps aux | grep concourse
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Wait a minute
+    ansible.builtin.pause:
+      minutes: 0.5
+  - name: Check with netstat
+    ansible.builtin.shell: netstat -plnt
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Clean /etc/resolv.conf
+    ansible.builtin.shell: |
+      >/etc/resolv.conf
+  - name: apply dns config
+    ansible.builtin.blockinfile:
+      path: /etc/resolv.conf
+      block: |
+        nameserver 192.168.1.250

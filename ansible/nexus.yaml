@@ -1,0 +1,380 @@
+---
+- name: Wait for ssh connection
+  hosts: all
+  gather_facts: False
+  tasks: 
+  - name: Ensure ssh port open
+    ansible.builtin.wait_for:
+      port: 22
+      delay: 60
+      timeout: 300
+      search_regex: OpenSSH
+      host: '{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}'
+    vars:
+      ansible_connection: local
+
+- name: Install packages
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Update apt repo and cache
+    ansible.builtin.apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+  - name: Install Java 8
+    ansible.builtin.apt: name=openjdk-8-jre-headless      
+  - name: Install net-tools
+    ansible.builtin.apt: name=net-tools  
+  # - name: "Install nginx"
+  #   ansible.builtin.apt: "name={{ item }} state=present"
+  #   with_items:
+  #     - nginx
+
+- name: Download and unpack Nexus installer
+  hosts: all
+  become: True
+  become_user: root
+  tasks: 
+  - name: Check nexus folder stats
+    ansible.builtin.stat:
+      path: /opt/nexus
+    register: stat_result  
+  - name: Download Nexus
+    ansible.builtin.get_url: 
+      url: https://download.sonatype.com/nexus/3/latest-unix.tar.gz
+      dest: /opt/
+    register: download_result  
+    when: not stat_result.stat.exists 
+  - name: Untar nexus installer
+    ansible.builtin.unarchive:
+      src: "{{download_result.dest}}"
+      dest: /opt/ 
+      remote_src: True   
+    when: not stat_result.stat.exists    
+  - name: Find nexus folder
+    ansible.builtin.find: 
+      paths: /opt
+      pattern: "nexus-*"
+      file_type: directory
+    register: find_result
+  - name: Rename nexus folder
+    ansible.builtin.shell: mv {{find_result.files[0].path}} /opt/nexus
+    when: not stat_result.stat.exists  
+
+# - name: Setup Openssl
+#   hosts: all
+#   become: True
+#   become_user: root
+#   tasks:
+#   - name: Check key exists
+#     ansible.builtin.stat:
+#       path: /opt/nexus/nexus.key
+#     register: stat_result  
+#   - name: Set subjectAltName
+#     ansible.builtin.blockinfile:
+#       path: /etc/ssl/openssl.cnf
+#       insertafter: "\\[ v3_ca \\]"
+#       block: |
+#         subjectAltName = IP:192.168.1.71
+#     when: not stat_result.stat.exists
+#   - name: Generate cert
+#     ansible.builtin.shell: |
+#       openssl req -x509 -nodes -sha256 -newkey rsa:4096 -keyout /opt/nexus/nexus.key -out /opt/nexus/nexus.crt -days 365 -subj '/CN=192.168.1.71'
+#     when: not stat_result.stat.exists
+
+
+- name: Create nexus user to own nexus folders
+  hosts: all
+  become: True
+  become_user: root
+  tasks:
+  - name: Ensure group nexus exists
+    ansible.builtin.group: 
+      name: nexus
+      state: present
+  - name: Create nexus user
+    ansible.builtin.user: 
+      name: nexus
+      group: nexus
+  - name: Make nexus user owner of nexus folder
+    ansible.builtin.file: 
+      path: /opt/nexus
+      state: directory
+      owner: nexus
+      group: nexus
+      recurse: yes    
+  - name: Make nexus user owner of sonatype-work folder
+    ansible.builtin.file:
+      path: /opt/sonatype-work
+      state: directory
+      owner: nexus
+      group: nexus
+      recurse: yes
+
+- name: Setup keytool
+  hosts: all
+  become: True
+  become_user: nexus
+  tasks: 
+  - name: Check nexus folder stats
+    ansible.builtin.stat:
+      path: /opt/nexus/etc/ssl/keystore.jks
+    register: stat_result  
+  - name: Generate keystore
+    ansible.builtin.raw: |
+      #keytool -genkeypair -keystore /opt/nexus/etc/ssl/keystore.jks -storepass password -keypass password -alias jetty -keyalg RSA -keysize 2048 -validity 365 -dname 'CN=nexus.ekml.int, OU=personal, O=ekml, L=East Meadow, ST=New York, C=US' -ext 'SAN=DNS:nexus.ekml.int,IP:192.168.1.71' -ext 'BC=ca:true'
+      keytool -genkeypair -keystore /opt/nexus/etc/ssl/keystore.jks -storepass password -keypass password -alias jetty -keyalg RSA -keysize 2048 -validity 365 -dname 'CN=192.168.1.71, OU=personal, O=ekml, L=East Meadow, ST=New York, C=US' -ext 'SAN=IP:192.168.1.71' -ext 'BC=ca:true'
+    when: not stat_result.stat.exists  
+    register: systemctl_result 
+  - ansible.builtin.debug: msg={{ systemctl_result }}
+  - name: Generate certs
+    ansible.builtin.raw: |
+      keytool -export -alias jetty -storepass password -keystore /opt/nexus/etc/ssl/keystore.jks -rfc -file /opt/nexus/etc/ssl/nexus.crt
+    when: not stat_result.stat.exists  
+    register: systemctl_result 
+  - ansible.builtin.debug: msg={{ systemctl_result }}
+  - name: Set /etc/hosts
+    ansible.builtin.blockinfile:
+      path: /etc/hosts
+      block: |
+        192.168.1.71  nexus nexus.ekml.int
+    become: yes
+    become_user: root
+    when: not stat_result.stat.exists  
+  - name: Clean jetty-https.xml
+    ansible.builtin.shell: |
+      >/opt/nexus/etc/jetty/jetty-https.xml
+    when: not stat_result.stat.exists  
+  - name: Set https config
+    ansible.builtin.blockinfile:
+      path: /opt/nexus/etc/jetty/jetty-https.xml
+      marker: ""
+      block: |
+        <!DOCTYPE Configure PUBLIC "-//Jetty//Configure//EN" "http://www.eclipse.org/jetty/configure_9_0.dtd">
+        <Configure id="Server" class="org.eclipse.jetty.server.Server">
+
+          <!--
+          ==== HTTPS ====
+          Set the following inside nexus.properties:
+          application-port-ssl: the port to listen for https connections
+          -->
+
+          <Ref refid="httpConfig">
+            <Set name="secureScheme">https</Set>
+            <Set name="securePort"><Property name="application-port-ssl" /></Set>
+          </Ref>
+
+          <New id="httpsConfig" class="org.eclipse.jetty.server.HttpConfiguration">
+            <Arg><Ref refid="httpConfig"/></Arg>
+            <Call name="addCustomizer">
+              <Arg>
+                <New id="secureRequestCustomizer" class="org.eclipse.jetty.server.SecureRequestCustomizer">
+                  <!-- 7776000 seconds = 90 days -->
+                  <Set name="stsMaxAge"><Property name="jetty.https.stsMaxAge" default="7776000"/></Set>
+                  <Set name="stsIncludeSubDomains"><Property name="jetty.https.stsIncludeSubDomains" default="false"/></Set>
+                  <Set name="sniHostCheck"><Property name="jetty.https.sniHostCheck" default="false"/></Set>
+                </New>
+              </Arg>
+            </Call>
+          </New>
+
+          <New id="sslContextFactory" class="org.eclipse.jetty.util.ssl.SslContextFactory$Server">
+            <Set name="KeyStorePath"><Property name="ssl.etc"/>/keystore.jks</Set>
+            <Set name="KeyStorePassword">password</Set>
+            <Set name="KeyManagerPassword">password</Set>
+            <Set name="TrustStorePath"><Property name="ssl.etc"/>/keystore.jks</Set>
+            <Set name="TrustStorePassword">password</Set>
+            <Set name="EndpointIdentificationAlgorithm"></Set>
+            <Set name="NeedClientAuth"><Property name="jetty.ssl.needClientAuth" default="false"/></Set>
+            <Set name="WantClientAuth"><Property name="jetty.ssl.wantClientAuth" default="false"/></Set>
+            <Set name="IncludeProtocols">
+              <Array type="java.lang.String">
+                <Item>TLSv1.2</Item>
+              </Array>
+            </Set>
+          </New>
+
+          <Call  name="addConnector">
+            <Arg>
+              <New id="httpsConnector" class="org.eclipse.jetty.server.ServerConnector">
+                <Arg name="server"><Ref refid="Server" /></Arg>
+                <Arg name="acceptors" type="int"><Property name="jetty.https.acceptors" default="-1"/></Arg>
+                <Arg name="selectors" type="int"><Property name="jetty.https.selectors" default="-1"/></Arg>
+                <Arg name="factories">
+                  <Array type="org.eclipse.jetty.server.ConnectionFactory">
+                    <Item>
+                      <New class="org.sonatype.nexus.bootstrap.jetty.InstrumentedConnectionFactory">
+                        <Arg>
+                          <New class="org.eclipse.jetty.server.SslConnectionFactory">
+                            <Arg name="next">http/1.1</Arg>
+                            <Arg name="sslContextFactory"><Ref refid="sslContextFactory"/></Arg>
+                          </New>
+                        </Arg>
+                      </New>
+                    </Item>
+                    <Item>
+                      <New class="org.eclipse.jetty.server.HttpConnectionFactory">
+                        <Arg name="config"><Ref refid="httpsConfig" /></Arg>
+                      </New>
+                    </Item>
+                  </Array>
+                </Arg>
+
+                <Set name="host"><Property name="application-host" /></Set>
+                <Set name="port"><Property name="application-port-ssl" /></Set>
+                <Set name="idleTimeout"><Property name="jetty.https.timeout" default="30000"/></Set>
+                <Set name="acceptorPriorityDelta"><Property name="jetty.https.acceptorPriorityDelta" default="0"/></Set>
+                <Set name="acceptQueueSize"><Property name="jetty.https.acceptQueueSize" default="0"/></Set>
+              </New>
+            </Arg>
+          </Call>
+        </Configure>
+    when: not stat_result.stat.exists  
+  - name: Setup https port properties
+    ansible.builtin.lineinfile:
+      path: /opt/nexus/etc/nexus-default.properties
+      regexp: '^# Jetty section'
+      line: application-port-ssl=8443
+    when: not stat_result.stat.exists  
+  - name: Setup nexus-args properties
+    ansible.builtin.lineinfile:
+      path: /opt/nexus/etc/nexus-default.properties
+      regexp: '^nexus-args=\${jetty\.etc}\/jetty\.xml,\${jetty\.etc}\/jetty-http\.xml,\${jetty\.etc}\/jetty-requestlog\.xml'
+      line: nexus-args=${jetty.etc}/jetty.xml,${jetty.etc}/jetty-http.xml,${jetty.etc}/jetty-requestlog.xml,${jetty.etc}/jetty-https.xml
+    when: not stat_result.stat.exists  
+
+
+- name: Start nexus with nexus user
+  hosts: all
+  become: True
+  become_user: nexus
+  tasks:
+  - name: Set run_as_user nexus
+    ansible.builtin.lineinfile:
+      path: /opt/nexus/bin/nexus.rc
+      regexp: '^#run_as_user=""'
+      line: run_as_user="nexus"
+  - name: Start nexus
+    ansible.builtin.command: /opt/nexus/bin/nexus start
+
+
+# - name: Start Nginx
+#   hosts: all
+#   become: True
+#   become_user: root
+#   tasks:
+#   - name: Configure Nginx
+#     ansible.builtin.shell: |
+#       >/etc/nginx/nginx.conf 
+#   - name: Set config
+#     ansible.builtin.blockinfile:
+#       path: /etc/nginx/nginx.conf
+#       block: |
+#         worker_processes 1;
+
+#         events {
+#             worker_connections 1024;
+#         }
+
+#         http {
+#           error_log /var/log/nginx/error.log warn;
+#           access_log  /dev/null;
+#           proxy_intercept_errors off;
+#           proxy_send_timeout 120;
+#           proxy_read_timeout 300;
+
+#           upstream nexus {
+#             server localhost:8081;
+#           }
+
+#           upstream registry {
+#             server localhost:5000;
+#           }
+
+#           server {
+#             listen 80;
+#             listen 443 ssl default_server;
+#             server_name 192.168.1.71;
+
+#             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+#             ssl_certificate /opt/nexus/nexus.crt;
+#             ssl_certificate_key /opt/nexus/nexus.key;
+#             ssl_session_cache shared:SSL:10m;
+#             ssl_session_timeout 5m;
+#             ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+#             ssl_prefer_server_ciphers on;
+#             ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:ECDHE-RSA-AES128-GCM-SHA256:AES256+EECDH:DHE-RSA-AES128-GCM-SHA256:AES256+EDH:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES128-SHA256:DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256:AES256-SHA:AES128-SHA:DES-CBC3-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4";
+
+
+#             keepalive_timeout  5 5;
+#             proxy_buffering    off;
+
+#             # allow large uploads
+#             client_max_body_size 1G;
+
+#             location / {
+#               # redirect to docker registry
+#               if ($http_user_agent ~ docker ) {
+#                 proxy_pass http://registry;
+#               }
+#               proxy_pass http://nexus;
+#               proxy_set_header Host $host;
+#               proxy_set_header X-Real-IP $remote_addr;
+#               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#               proxy_set_header X-Forwarded-Proto "https";
+#             }
+#           }
+#         }
+#   - name: Start nginx
+#     ansible.builtin.shell: |
+#       systemctl daemon-reload nginx
+#       systemctl start nginx
+#       systemctl restart nginx
+#       systemctl enable nginx
+#       systemctl status nginx
+#       systemctl is-active nginx
+#     register: systemctl_result 
+#   - ansible.builtin.debug: msg={{ systemctl_result }}
+
+
+- name: Verify nexus running
+  hosts: all
+  become: True
+  become_user: nexus
+  tasks:
+  - name: Check with ps
+    ansible.builtin.shell: ps aux | grep nexus
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Wait one minute
+    ansible.builtin.pause:
+      minutes: 1
+  - name: Check with netstat
+    ansible.builtin.shell: netstat -plnt
+    register: app_status
+  - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+  - name: Clean /etc/resolv.conf
+    ansible.builtin.shell: |
+      >/etc/resolv.conf
+  - name: apply dns config
+    ansible.builtin.blockinfile:
+      path: /etc/resolv.conf
+      block: |
+        nameserver 192.168.1.250
+        
+# - name: Verify service running
+#   hosts: all
+#   become: True
+#   become_user: root
+#   tasks:
+#   - name: Check with ps
+#     ansible.builtin.shell: ps aux | grep nginx
+#     register: app_status
+#   - ansible.builtin.debug: msg={{app_status.stdout_lines}}
+#   - name: Wait a minute
+#     ansible.builtin.pause:
+#       minutes: 0.5
+#   - name: Check with netstat
+#     ansible.builtin.shell: netstat -plnt
+#     register: app_status
+#   - ansible.builtin.debug: msg={{app_status.stdout_lines}}

@@ -1,0 +1,41 @@
+#cloud-config
+bootcmd:
+  - date > /etc/birth_certificate
+
+users:
+  - name: "${username}"
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    home: "/home/${username}"
+    shell: /bin/bash
+    ssh-authorized-keys:
+      - ssh-rsa $pubKey
+
+#>mkpasswd -m sha-512
+chpasswd:
+  list: |
+     $username:$passwordHash
+  expire: False      
+
+ssh_pwauth: False
+
+disable_root: True
+
+package_update: true
+
+packages:
+  - qemu-guest-agent
+  - curl
+
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, qemu-guest-agent.service ]
+  - [ systemctl, start, --no-block, qemu-guest-agent.service  ]
+
+growpart:
+  mode: auto
+  devices: ['/']
+
+hostname: "${hostname}"
+
+timezone: "${timezone}"
